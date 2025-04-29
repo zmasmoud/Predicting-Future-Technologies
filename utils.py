@@ -2,38 +2,56 @@ import faiss
 import json
 import pypdf
 import os 
-from tqdm import tqdm
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+from huggingface_hub import HfApi, hf_hub_download
+from tqdm.notebook import tqdm
 
 class ChunkLoader:
     @staticmethod
     def load_chunks(file_path):
-        document_chunks = []
+        chunks = []
         with open(file_path, 'r') as f:
             for line in f:
                 chunk = json.loads(line)["chunk"]
-                document_chunks.append(chunk)
-        return document_chunks
+                chunks.append(chunk)
+        return chunks
 
 class RAGEncoder:
-    def __init__(self, rag_encoder_model, rag_encoder_tokenizer):
-        self.rag_encoder_model = rag_encoder_model
-        self.rag_encoder_tokenizer = rag_encoder_tokenizer
+    def __init__(self, tokenizer, model, device):
+        self.tokenizer = tokenizer
+        self.model = model.to(device)
+        self.device = device
 
     def encode_text(self, text):
-        # inputs = self.rag_encoder_tokenizer(question, return_tensors='pt')
+        # inputs = self.tokenizer(text, return_tensors='pt', padding=True).to(self.device)
         # with torch.no_grad():
-        #     text_embedding = self.rag_encoder_model(**inputs).pooler_output.numpy()
-        text_embedding = self.rag_encoder_model.encode(text)
-        return text_embedding
+        #   last_hidden_state_embeddings = self.model(**inputs, output_hidden_states=True).hidden_states[-1]
+        #   expanded_attention_mask = inputs.attention_mask.unsqueeze(-1).expand(last_hidden_state_embeddings.shape)
+        #   text_embedding = (last_hidden_state_embeddings * expanded_attention_mask).sum(dim=1) / expanded_attention_mask.sum(dim=1)
+        text_embedding = self.model.encode(text)
+        ### slower way of getting mean pooled embeddings
+        # mean_pooled_sentences_embeddings = []
+        # for sentence_idx in range(last_hidden_state_embeddings.shape[0]):
+        #   kept_tokens_embeddings = [token_embedding for token_idx, token_embedding in enumerate(last_hidden_state_embeddings[sentence_idx]) if inputs.attention_mask[sentence_idx][token_idx] == 1]
+        #   mean_pooled_sentences_embeddings.append(sum(kept_tokens_embeddings)/len(kept_tokens_embeddings))
+        # text_embedding = torch.vstack(mean_pooled_sentences_embeddings)
 
-def retrieve_relevant_docs(question, index, chunks, question_encoder, topk=3, normalize=True):
+        # return the sentence(s) embedding(s) as a numpy array for either storage on faiss or dot product for similarity calculation 
+        return text_embedding #.cpu().numpy()   # in order to return a numpy array we need to bring the tensor back to the cpu side (in case we were using a gpu)
+
+def retrieve_relevant_chunks(question, index, chunks, question_encoder, topk=3, normalize=True):
     question_embedding = question_encoder.encode_text(question)
     print(type(question_embedding))
     question_embedding = question_embedding.reshape(1, -1) if question_embedding.ndim == 1 else question_embedding
-    #normalize the question embedding so that inner product between question and chunk = cosine similarity
+    # normalize the question embedding so that inner product between question and chunk = cosine similarity
     if normalize: faiss.normalize_L2(question_embedding)
-    distances, indices = index.search(question_embedding, topk)
-    return [(chunks[idx], distances[0][j]) for j, idx in enumerate(indices[0])]
+    # for IP metric, similarities is a representative name for the first element of index.search output tuple  
+    # for L2 metric, distances is a representative name for the first element of index.search output tuple
+    _, indices = index.search(question_embedding, topk)  
+    return [chunks[idx] for idx in indices[0]]
 
 def read_pdf(file_path):
   reader = pypdf.PdfReader(file_path)
@@ -42,7 +60,8 @@ def read_pdf(file_path):
     text += page.extract_text()
   return text
 
-def get_pdf_chunks(text, tokenizer, max_chunk_size, overlap):
+def get_file_chunks(file_path, tokenizer, max_chunk_size, overlap):
+  text = read_pdf(file_path)
   chunks = []
   tokens = tokenizer.encode(text, add_special_tokens=False)
   for i in range(0, len(tokens), max_chunk_size - overlap):
@@ -53,8 +72,84 @@ def get_pdf_chunks(text, tokenizer, max_chunk_size, overlap):
 
 def get_all_chunks(folder_path, tokenizer, max_chunk_size, overlap):
   all_chunks = []
-  for file_name in tqdm(os.listdir(folder_path), desc="reading folder..."):
-    text = read_pdf(folder_path + "/" + file_name)
-    chunks = get_pdf_chunks(text, tokenizer, max_chunk_size, overlap)
+  for file_name in tqdm(os.listdir(folder_path), desc="getting chunks from folder " + folder_path + " ..."):
+    chunks = get_file_chunks(folder_path + "/" + file_name, tokenizer, max_chunk_size, overlap)
     all_chunks += chunks
   return all_chunks
+
+def show_chunks_statistics(chunks, tokenizer):
+  print("The total number of chunks is: ", len(chunks))
+  nb_words = []
+  nb_chars = []
+  nb_tokens = []
+  for chunk in chunks:
+    nb_words_chunk = len(chunk.split(' '))
+    nb_chars_chunk = len(chunk)
+    nb_tokens_chunk = len(tokenizer.encode(chunk))
+    nb_words.append(nb_words_chunk)
+    nb_chars.append(nb_chars_chunk)
+    nb_tokens.append(nb_tokens_chunk)
+
+
+  # Disclaimer: this part of the code was generated by chatGPT as it's only used for visualization
+  # purposes for me to check if everything is as intended and is not part of the coding logic.
+  fig, axes = plt.subplots(1, 3, figsize=(15, 5))  # Create 3 subplots in one row
+
+  # Plot the number of words
+  axes[0].hist(nb_words, bins=100)
+  axes[0].set_title('Number of Words per Chunk')
+  axes[0].set_xlabel('Number of Words')
+  axes[0].set_ylabel('Frequency')
+
+  # Plot the number of characters
+  axes[1].hist(nb_chars, bins=100)
+  axes[1].set_title('Number of Characters per Chunk')
+  axes[1].set_xlabel('Number of Characters')
+  axes[1].set_ylabel('Frequency')
+
+  # Plot the number of tokens
+  axes[2].hist(nb_tokens, bins=100)
+  axes[2].set_title('Number of Tokens per Chunk')
+  axes[2].set_xlabel('Number of Tokens')
+  axes[2].set_ylabel('Frequency')
+
+  plt.tight_layout() # Adjust spacing between subplots
+  plt.show()
+
+def get_index_and_chunks(rag_chunks_filename, rag_embeddings_filename):
+  # Load chunks and their corresponding embeddings
+  chunks_file = hf_hub_download(repo_id="ziedM/rag_dataset", filename=rag_chunks_filename, repo_type="dataset")
+  chunks = ChunkLoader.load_chunks(chunks_file)
+  embeddings_file = hf_hub_download(repo_id="ziedM/rag_dataset", filename=rag_embeddings_filename, repo_type="dataset")
+  chunks_embeddings = np.load(embeddings_file)
+  # L2 normalization of the embedding vectors
+  faiss.normalize_L2(chunks_embeddings)
+
+  # Initialize FAISS index
+  embedding_dimension = chunks_embeddings.shape[1]
+  # Inner-product-based similarity score (in our case, same as cosine as vectors are normalized)
+  index = faiss.IndexFlatIP(embedding_dimension)
+  index.add(chunks_embeddings)
+
+  return index, chunks
+
+def get_formatted_prompt(instruction, context, question, RAG):
+  formatted_query = (
+    instruction + "\n"
+    + "Context: {}\n"
+    + " Question: {}\n"
+    + " Answer: "
+  ).format(context, question) if RAG else (
+    instruction + "\n"
+    + " Question: {}\n"
+    + " Answer: "
+  ).format(question)
+  return formatted_query
+
+def generate_answer(prompt, tokenizer, model, device):
+  inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=tokenizer.model_max_length).to(device)
+  outputs = model(**inputs)
+  generated_token_ids = model.generate(**inputs, pad_token_id=tokenizer.pad_token_id, num_beams=4, do_sample=True, top_p=0.95, max_new_tokens=tokenizer.model_max_length-inputs.input_ids.shape[1])
+  generated_text = tokenizer.decode(generated_token_ids[0])
+  return generated_text
+
